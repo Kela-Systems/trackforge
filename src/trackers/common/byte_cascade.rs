@@ -2,12 +2,13 @@
 //!
 //! ByteTrack and BoT-SORT run the same cascade. High confidence detections are matched
 //! against the pool of tracked and lost tracks, low confidence detections then try to
-//! recover the still-tracked leftovers, unmatched high detections start new tracks, and
-//! originally-lost tracks are kept alive until they age out of the buffer.
+//! recover the still-tracked leftovers, and originally-lost tracks are kept alive until
+//! they age out of the buffer. [`spawn`] then starts new tracks from the high detections
+//! nothing took.
 //!
-//! The only thing that differs between the two is the stage-one cost matrix. ByteTrack
-//! passes a plain IoU distance; BoT-SORT passes an appearance-fused cost. Camera motion
-//! is applied by BoT-SORT before the cascade runs. Everything else lives here once.
+//! The stage-one cost matrix differs between the two. ByteTrack passes a plain IoU
+//! distance; BoT-SORT passes an appearance-fused cost. Camera motion is applied by
+//! BoT-SORT before the cascade runs. Everything else lives here once.
 
 use crate::utils::assignment::{greedy_match, iou_match};
 use crate::utils::kalman::KalmanFilter;
@@ -40,18 +41,20 @@ pub(crate) trait CascadeTrack: Sized + Clone {
     fn update_matched(&mut self, det: &Self::Det, frame_id: usize, kf: &KalmanFilter);
     /// Bring a lost track back with a matched detection, keeping its id.
     fn reactivate_matched(&mut self, det: &Self::Det, frame_id: usize, kf: &KalmanFilter);
-    /// Create and activate a brand-new track from a detection.
+    /// Create a brand-new track from a detection.
     fn spawn(det: &Self::Det, frame_id: usize, track_id: u64, kf: &KalmanFilter) -> Self;
 }
 
 /// The tracks produced by one cascade pass, ready for the caller to commit.
 pub(crate) struct CascadeOutcome<T> {
-    /// Tracks matched this frame or freshly spawned.
+    /// Tracks matched this frame.
     pub activated: Vec<T>,
     /// Lost tracks recovered this frame.
     pub refind: Vec<T>,
     /// Tracks that are lost and still within the buffer.
     pub lost: Vec<T>,
+    /// Indices of the high detections no track took.
+    pub unmatched_high: Vec<usize>,
 }
 
 /// Run the two-stage cascade over a pool of tracks.
@@ -67,11 +70,9 @@ pub(crate) fn run<T: CascadeTrack>(
     stage1_cost: &[Vec<f32>],
     match_thresh: f32,
     second_match_thresh: f32,
-    det_thresh: f32,
     buffer_size: usize,
     frame_id: usize,
     kf: &KalmanFilter,
-    next_id: &mut u64,
 ) -> CascadeOutcome<T> {
     let mut activated = Vec::new();
     let mut refind = Vec::new();
@@ -124,16 +125,6 @@ pub(crate) fn run<T: CascadeTrack>(
         }
     }
 
-    // Unmatched high detections above the init threshold start new tracks.
-    for &idet in &u_det_high {
-        if high[idet].det_score() < det_thresh {
-            continue;
-        }
-        let track = T::spawn(&high[idet], frame_id, *next_id, kf);
-        *next_id += 1;
-        activated.push(track);
-    }
-
     // Keep originally-lost tracks that stayed unmatched alive until they exceed the
     // buffer. Tracks that just became lost in stage two are already in `lost`, so this
     // is restricted to the originally-lost part of the pool (indices at or past
@@ -148,5 +139,26 @@ pub(crate) fn run<T: CascadeTrack>(
         activated,
         refind,
         lost,
+        unmatched_high: u_det_high,
     }
+}
+
+/// Start a new track from each high detection in `unmatched` that reaches `det_thresh`.
+pub(crate) fn spawn<T: CascadeTrack>(
+    high: &[T::Det],
+    unmatched: &[usize],
+    det_thresh: f32,
+    frame_id: usize,
+    kf: &KalmanFilter,
+    next_id: &mut u64,
+) -> Vec<T> {
+    unmatched
+        .iter()
+        .filter(|&&idet| high[idet].det_score() >= det_thresh)
+        .map(|&idet| {
+            let track = T::spawn(&high[idet], frame_id, *next_id, kf);
+            *next_id += 1;
+            track
+        })
+        .collect()
 }

@@ -331,14 +331,20 @@ impl ByteTrack {
             &cost,
             self.match_thresh,
             self.second_match_thresh,
-            self.det_thresh,
             self.buffer_size,
             self.frame_id,
             &self.kalman_filter,
-            &mut self.next_id,
         );
 
         self.tracked_stracks = outcome.activated;
+        self.tracked_stracks.extend(byte_cascade::spawn(
+            &detections_high,
+            &outcome.unmatched_high,
+            self.det_thresh,
+            self.frame_id,
+            &self.kalman_filter,
+            &mut self.next_id,
+        ));
         self.tracked_stracks.extend(outcome.refind);
         self.lost_stracks = outcome.lost;
 
