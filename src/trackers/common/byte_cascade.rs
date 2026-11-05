@@ -8,10 +8,15 @@
 //!
 //! The stage-one cost matrix differs between the two. ByteTrack passes a plain IoU
 //! distance; BoT-SORT passes an appearance-fused cost. Camera motion is applied by
-//! BoT-SORT before the cascade runs. Everything else lives here once.
+//! BoT-SORT before the cascade runs. BoT-SORT also holds a new track back until its next
+//! match: [`confirm`] offers those tracks the high detections the cascade left, before
+//! [`spawn`] runs. Everything else lives here once.
 
 use crate::utils::assignment::{greedy_match, iou_match};
 use crate::utils::kalman::KalmanFilter;
+
+/// Maximum cost for matching an unconfirmed track in [`confirm`].
+const CONFIRM_MATCH_THRESH: f32 = 0.7;
 
 /// A detection the cascade can read: its box and its score.
 pub(crate) trait CascadeDet {
@@ -141,6 +146,37 @@ pub(crate) fn run<T: CascadeTrack>(
         lost,
         unmatched_high: u_det_high,
     }
+}
+
+/// Match unconfirmed tracks against the high detections in `unmatched_high`.
+///
+/// `cost[i][k]` is the cost of pairing `unconfirmed[i]` with `high[unmatched_high[k]]`.
+/// A matched track is updated and returned; an unmatched one is dropped. Returns the
+/// matched tracks and the detections still left.
+pub(crate) fn confirm<T: CascadeTrack>(
+    mut unconfirmed: Vec<T>,
+    high: &[T::Det],
+    unmatched_high: &[usize],
+    cost: &[Vec<f32>],
+    frame_id: usize,
+    kf: &KalmanFilter,
+) -> (Vec<T>, Vec<usize>) {
+    if unconfirmed.is_empty() || unmatched_high.is_empty() {
+        return (Vec::new(), unmatched_high.to_vec());
+    }
+    let (matches, _, u_det) = greedy_match(cost, CONFIRM_MATCH_THRESH);
+    let confirmed = matches
+        .into_iter()
+        .map(|(itrack, local)| {
+            unconfirmed[itrack].update_matched(&high[unmatched_high[local]], frame_id, kf);
+            unconfirmed[itrack].clone()
+        })
+        .collect();
+    let left = u_det
+        .into_iter()
+        .map(|local| unmatched_high[local])
+        .collect();
+    (confirmed, left)
 }
 
 /// Start a new track from each high detection in `unmatched` that reaches `det_thresh`.

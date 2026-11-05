@@ -66,7 +66,7 @@ impl STrack {
         self.frame_id = frame_id;
         self.start_frame = frame_id;
         self.state = TrackState::Tracked;
-        self.is_activated = true;
+        self.is_activated = frame_id == 1;
         self.track_id = track_id;
         self.tracklet_len = 0;
 
@@ -262,8 +262,8 @@ impl ByteTrack {
 
     /// Create a ByteTrack tracker from a [`ByteTrackParams`].
     ///
-    /// ByteTrack activates a track on its first high confidence match, so
-    /// `params.common.min_hits` has no effect here; only `common.max_age` is used.
+    /// ByteTrack confirms a new track on its next match, so `params.common.min_hits` has
+    /// no effect here; only `common.max_age` is used.
     pub fn from_params(params: ByteTrackParams) -> Self {
         Self {
             tracked_stracks: Vec::new(),
@@ -304,17 +304,19 @@ impl ByteTrack {
             }
         }
 
-        // Predict every existing track forward.
-        for track in self
-            .tracked_stracks
-            .iter_mut()
-            .chain(&mut self.lost_stracks)
-        {
+        // A track started after the first frame stays unconfirmed until its next match.
+        // It sits out both cascade stages and is not predicted.
+        let (unconfirmed, mut pool): (Vec<STrack>, Vec<STrack>) =
+            std::mem::take(&mut self.tracked_stracks)
+                .into_iter()
+                .partition(|t| !t.is_activated);
+
+        // Predict every confirmed track forward.
+        for track in pool.iter_mut().chain(&mut self.lost_stracks) {
             track.predict(&self.kalman_filter);
         }
 
-        // Pool: tracked tracks first, then lost tracks.
-        let mut pool: Vec<STrack> = std::mem::take(&mut self.tracked_stracks);
+        // Pool: confirmed tracked tracks first, then lost tracks.
         let n_tracked = pool.len();
         pool.append(&mut self.lost_stracks);
 
@@ -336,10 +338,35 @@ impl ByteTrack {
             &self.kalman_filter,
         );
 
-        self.tracked_stracks = outcome.activated;
-        self.tracked_stracks.extend(byte_cascade::spawn(
+        // Unconfirmed tracks may only take the high-confidence detections the cascade
+        // left, on the IoU distance fused with the detection score.
+        let confirm_cost: Vec<Vec<f32>> = unconfirmed
+            .iter()
+            .map(|track| {
+                outcome
+                    .unmatched_high
+                    .iter()
+                    .map(|&i| {
+                        let det = &detections_high[i];
+                        1.0 - crate::utils::geometry::iou(&track.tlwh, &det.tlwh) * det.score
+                    })
+                    .collect()
+            })
+            .collect();
+        let (confirmed, unmatched_high) = byte_cascade::confirm(
+            unconfirmed,
             &detections_high,
             &outcome.unmatched_high,
+            &confirm_cost,
+            self.frame_id,
+            &self.kalman_filter,
+        );
+
+        self.tracked_stracks = outcome.activated;
+        self.tracked_stracks.extend(confirmed);
+        self.tracked_stracks.extend(byte_cascade::spawn(
+            &detections_high,
+            &unmatched_high,
             self.det_thresh,
             self.frame_id,
             &self.kalman_filter,
@@ -544,7 +571,9 @@ mod tests {
         let tracks1 = tracker.update(det1);
         assert_eq!(tracks1[0].track_id, 1);
 
+        // A track started after the first frame is confirmed on its next match.
         let det2 = vec![([200.0, 200.0, 50.0, 100.0], 0.9_f32, 1_i64)];
+        tracker.update(det2.clone());
         let tracks2 = tracker.update(det2);
         assert_eq!(tracks2[0].track_id, 2);
     }

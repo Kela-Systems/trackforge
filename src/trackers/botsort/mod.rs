@@ -32,7 +32,7 @@ pub struct BotTrack {
     pub score: f32,
     /// Class label of the most recent match.
     pub class_id: i64,
-    /// Unique track identifier (0 until the track is activated).
+    /// Unique track identifier, assigned when the track starts.
     pub track_id: u64,
     /// Lifecycle state (`New`, `Tracked`, `Lost`, `Removed`).
     pub state: TrackState,
@@ -71,11 +71,12 @@ impl BotTrack {
         }
     }
 
-    /// Confirm a fresh detection as a new track with the given id.
+    /// Start a new track with the given id. Only a track started on the first frame is
+    /// confirmed at once; any later one waits for its next match.
     fn activate(&mut self, frame_id: usize, track_id: u64) {
         self.track_id = track_id;
         self.state = TrackState::Tracked;
-        self.is_activated = true;
+        self.is_activated = frame_id == 1;
         self.frame_id = frame_id;
         self.start_frame = frame_id;
         self.tracklet_len = 0;
@@ -218,9 +219,9 @@ pub struct BotSort {
 ///
 /// BoT-SORT is ByteTrack plus camera motion and an optional appearance term, so its
 /// params look like ByteTrack's plus two Re-ID gates. Shared lifecycle fields live in
-/// [`CommonParams`]; BoT-SORT maps its track buffer onto `common.max_age` and, like
-/// ByteTrack, activates on the first match so `common.min_hits` has no effect. Build
-/// it with [`BotSortParams::default`].
+/// [`CommonParams`]; BoT-SORT maps its track buffer onto `common.max_age` and confirms a
+/// new track on its next match, so `common.min_hits` has no effect. Build it with
+/// [`BotSortParams::default`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BotSortParams {
     /// Shared lifecycle settings. `common.max_age` is the track buffer length.
@@ -304,8 +305,8 @@ impl BotSort {
 
     /// Create a BoT-SORT tracker from a [`BotSortParams`].
     ///
-    /// BoT-SORT activates a track on its first high confidence match, so
-    /// `params.common.min_hits` has no effect; only `common.max_age` is used.
+    /// BoT-SORT confirms a new track on its next match, so `params.common.min_hits` has
+    /// no effect; only `common.max_age` is used.
     pub fn from_params(params: BotSortParams) -> Self {
         Self {
             tracked_stracks: Vec::new(),
@@ -372,26 +373,33 @@ impl BotSort {
             }
         }
 
+        // A track started after the first frame stays unconfirmed until its next match.
+        // It sits out both cascade stages and is warped by camera motion but not
+        // predicted.
+        let (mut unconfirmed, mut tracked): (Vec<BotTrack>, Vec<BotTrack>) =
+            std::mem::take(&mut self.tracked_stracks)
+                .into_iter()
+                .partition(|t| !t.is_activated);
+
         // Predict, then warp by camera motion.
-        let warp = !camera_motion.is_identity();
-        for track in self
-            .tracked_stracks
-            .iter_mut()
-            .chain(&mut self.lost_stracks)
-        {
+        for track in tracked.iter_mut().chain(&mut self.lost_stracks) {
             track.predict(&self.kalman_filter);
-            if warp {
+        }
+        if !camera_motion.is_identity() {
+            for track in tracked
+                .iter_mut()
+                .chain(&mut self.lost_stracks)
+                .chain(&mut unconfirmed)
+            {
                 track.apply_camera_motion(camera_motion);
             }
         }
 
         // First stage: high-confidence detections against tracked + lost tracks,
-        // matched on the appearance-fused cost. Tracks are activated on creation, so
-        // pool[0..n_tracked] are the tracked tracks and the rest are lost.
-        let mut tracked: Vec<BotTrack> = std::mem::take(&mut self.tracked_stracks);
+        // matched on the appearance-fused cost. pool[0..n_tracked] are the confirmed
+        // tracked tracks and the rest are lost.
         let n_tracked = tracked.len();
-        let mut pool: Vec<BotTrack> = Vec::new();
-        pool.append(&mut tracked);
+        let mut pool: Vec<BotTrack> = tracked;
         pool.append(&mut self.lost_stracks);
 
         // Stage-one cost is the appearance-fused cost, which reduces to the plain IoU
@@ -411,16 +419,35 @@ impl BotSort {
             &self.kalman_filter,
         );
 
-        // Commit the frame state.
-        self.tracked_stracks = outcome.activated;
-        self.tracked_stracks.extend(byte_cascade::spawn(
+        // Unconfirmed tracks may only take the high-confidence detections the cascade
+        // left; whatever they leave starts new tracks.
+        let leftover: Vec<&Detection> = outcome
+            .unmatched_high
+            .iter()
+            .map(|&i| &dets_high[i])
+            .collect();
+        let confirm_cost = self.unconfirmed_cost(&unconfirmed, &leftover, use_reid);
+        let (confirmed, unmatched_high) = byte_cascade::confirm(
+            unconfirmed,
             &dets_high,
             &outcome.unmatched_high,
+            &confirm_cost,
+            self.frame_id,
+            &self.kalman_filter,
+        );
+        let spawned = byte_cascade::spawn(
+            &dets_high,
+            &unmatched_high,
             self.det_thresh,
             self.frame_id,
             &self.kalman_filter,
             &mut self.next_id,
-        ));
+        );
+
+        // Commit the frame state.
+        self.tracked_stracks = outcome.activated;
+        self.tracked_stracks.extend(confirmed);
+        self.tracked_stracks.extend(spawned);
         self.tracked_stracks.extend(outcome.refind);
         self.lost_stracks = outcome.lost;
 
@@ -447,7 +474,8 @@ impl BotSort {
                 (0..dets.len())
                     .map(|j| {
                         let iou_dist = 1.0 - ious[i][j];
-                        let emb = self.appearance_cost(use_reid, &tracks[i], &dets[j], iou_dist);
+                        let emb =
+                            self.appearance_cost(use_reid, &tracks[i], &dets[j], iou_dist, 1.0);
                         emb.map_or(iou_dist, |e| iou_dist.min(e))
                     })
                     .collect()
@@ -455,7 +483,39 @@ impl BotSort {
             .collect()
     }
 
-    /// Gated cosine appearance cost for one (track, detection) pair.
+    /// Unconfirmed-track cost matrix (`n_tracks x n_dets`).
+    ///
+    /// The IoU distance fused with the detection score, `1 - IoU * score`, combined by
+    /// taking the smaller with half the gated cosine appearance distance when embeddings
+    /// are present. The proximity gate reads the unfused IoU distance.
+    fn unconfirmed_cost(
+        &self,
+        tracks: &[BotTrack],
+        dets: &[&Detection],
+        use_reid: bool,
+    ) -> Vec<Vec<f32>> {
+        let track_boxes: Vec<[f32; 4]> = tracks.iter().map(|t| t.tlwh).collect();
+        let det_boxes: Vec<[f32; 4]> = dets.iter().map(|d| d.tlwh).collect();
+        let ious = iou_batch(&track_boxes, &det_boxes);
+
+        tracks
+            .iter()
+            .zip(&ious)
+            .map(|(track, row)| {
+                dets.iter()
+                    .zip(row)
+                    .map(|(det, &iou)| {
+                        let fused = 1.0 - iou * det.score;
+                        let emb = self.appearance_cost(use_reid, track, det, 1.0 - iou, 0.5);
+                        emb.map_or(fused, |e| fused.min(e))
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Gated cosine appearance cost for one (track, detection) pair, the cosine distance
+    /// scaled by `scale`.
     ///
     /// Returns `None` when appearance is unavailable or disabled. When the pair is not
     /// spatially close or the embeddings are too dissimilar, the cost is neutralised to
@@ -466,13 +526,14 @@ impl BotSort {
         track: &BotTrack,
         det: &Detection,
         iou_dist: f32,
+        scale: f32,
     ) -> Option<f32> {
         if !use_reid {
             return None;
         }
         let tf = track.smooth_feat.as_ref()?;
         let df = det.feature.as_ref()?;
-        let mut emb = cosine_distance(tf, df);
+        let mut emb = cosine_distance(tf, df) * scale;
         if emb > self.appearance_thresh || iou_dist > self.proximity_thresh {
             emb = 1.0;
         }
@@ -699,7 +760,8 @@ mod tests {
         for _ in 0..4 {
             t.update(vec![], &[]);
         }
-        // Beyond the buffer, re-detection starts a fresh id.
+        // Beyond the buffer, re-detection starts a fresh id, confirmed on its next match.
+        t.update(vec![det(10.0, 10.0, 50.0, 100.0, 0.9)], &[]);
         let tracks = t.update(vec![det(10.0, 10.0, 50.0, 100.0, 0.9)], &[]);
         assert_eq!(tracks.len(), 1);
         assert_ne!(tracks[0].track_id, id);
@@ -749,8 +811,121 @@ mod tests {
     fn without_camera_motion_a_large_shift_starts_a_new_track() {
         let mut t = BotSort::default();
         t.update(vec![det(100.0, 100.0, 50.0, 100.0, 0.9)], &[]);
+        t.update(vec![det(300.0, 100.0, 50.0, 100.0, 0.9)], &[]);
         let tracks = t.update(vec![det(300.0, 100.0, 50.0, 100.0, 0.9)], &[]);
         assert_eq!(tracks[0].track_id, 2);
+    }
+
+    #[test]
+    fn first_frame_tracks_are_confirmed_at_once_and_later_ones_are_not() {
+        let mut first = BotSort::default();
+        assert_eq!(
+            first
+                .update(vec![det(100.0, 100.0, 50.0, 100.0, 0.9)], &[])
+                .len(),
+            1
+        );
+
+        let mut later = BotSort::default();
+        later.update(vec![], &[]);
+        assert!(
+            later
+                .update(vec![det(100.0, 100.0, 50.0, 100.0, 0.9)], &[])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn new_track_is_confirmed_on_its_next_match() {
+        let mut t = BotSort::default();
+        let a = t.update(vec![det(10.0, 10.0, 50.0, 100.0, 0.9)], &[])[0].track_id;
+        let tracks = t.update(
+            vec![
+                det(10.0, 10.0, 50.0, 100.0, 0.9),
+                det(400.0, 10.0, 50.0, 100.0, 0.9),
+            ],
+            &[],
+        );
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].track_id, a);
+
+        let tracks = t.update(
+            vec![
+                det(10.0, 10.0, 50.0, 100.0, 0.9),
+                det(404.0, 10.0, 50.0, 100.0, 0.9),
+            ],
+            &[],
+        );
+        assert_eq!(tracks.len(), 2);
+        let b = tracks.iter().find(|t| t.track_id != a).unwrap();
+        assert!((b.tlwh[0] - 404.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn one_frame_flicker_gets_no_id_and_is_dropped() {
+        let mut t = BotSort::default();
+        let a = t.update(vec![det(10.0, 10.0, 50.0, 100.0, 0.9)], &[])[0].track_id;
+        let tracks = t.update(
+            vec![
+                det(10.0, 10.0, 50.0, 100.0, 0.9),
+                det(400.0, 10.0, 50.0, 100.0, 0.9),
+            ],
+            &[],
+        );
+        assert!(tracks.iter().all(|t| t.track_id == a));
+
+        t.update(vec![det(10.0, 10.0, 50.0, 100.0, 0.9)], &[]);
+        assert_eq!(t.tracked_stracks.len() + t.lost_stracks.len(), 1);
+    }
+
+    #[test]
+    fn unconfirmed_track_cannot_take_a_low_confidence_detection() {
+        let mut t = BotSort::new(0.6, 30, 0.8, 0.6, 0.5, 0.25);
+        t.update(vec![], &[]);
+        t.update(vec![det(10.0, 10.0, 50.0, 100.0, 0.9)], &[]);
+        assert!(
+            t.update(vec![det(10.0, 10.0, 50.0, 100.0, 0.4)], &[])
+                .is_empty()
+        );
+        assert!(t.tracked_stracks.is_empty() && t.lost_stracks.is_empty());
+    }
+
+    #[test]
+    fn established_track_keeps_its_box_when_a_duplicate_appears() {
+        // A weaker duplicate box beside the object starts a track. Were that track
+        // matched like a confirmed one, it would take the object's next box, which sits
+        // on the duplicate, from the established track.
+        let mut t = BotSort::default();
+        let a = t.update(vec![det(100.0, 100.0, 50.0, 100.0, 0.9)], &[])[0].track_id;
+        let tracks = t.update(
+            vec![
+                det(100.0, 100.0, 50.0, 100.0, 0.9),
+                det(110.0, 100.0, 50.0, 100.0, 0.7),
+            ],
+            &[],
+        );
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].track_id, a);
+
+        let tracks = t.update(vec![det(110.0, 100.0, 50.0, 100.0, 0.9)], &[]);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].track_id, a);
+    }
+
+    #[test]
+    fn unconfirmed_match_fuses_the_detection_score() {
+        // IoU 0.75 is a 0.25 IoU distance, but at score 0.6 the fused cost is
+        // 1 - 0.75 * 0.6 = 0.55. With the 0.7 gate it matches; at IoU 0.45 the fused
+        // cost 0.73 does not, though the plain IoU distance 0.55 would.
+        let confirms = |x: f32| {
+            let mut t = BotSort::new(0.5, 30, 0.8, 0.5, 0.5, 0.25);
+            t.update(vec![], &[]);
+            t.update(vec![det(100.0, 100.0, 100.0, 100.0, 0.9)], &[]);
+            !t.update(vec![det(x, 100.0, 100.0, 100.0, 0.6)], &[])
+                .is_empty()
+        };
+        assert!(confirms(100.0 + 100.0 / 7.0));
+        assert!(!confirms(100.0 + 100.0 * 0.55 / 1.45));
     }
 
     #[test]

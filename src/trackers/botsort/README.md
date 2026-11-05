@@ -24,6 +24,13 @@ The two-stage cascade is unchanged from ByteTrack: high-confidence detections ar
 first (on the fused cost), then low-confidence detections recover fragmented tracks on
 IoU alone.
 
+A new track is unconfirmed until its next frame, and is not returned until then. It sits
+out both stages, is warped by camera motion but not predicted, and may only match a
+high-confidence detection the cascade left, on the IoU distance fused with the detection
+score (`1 - IoU * score`, at most 0.7) and, with embeddings, half the gated cosine
+distance. It is confirmed on that match and dropped if it misses. Tracks started on the
+first frame are confirmed at once.
+
 This is a clean-room implementation. The tracker applies a camera-motion transform but
 does not estimate it: the caller supplies the affine (for example from image
 registration), keeping the core free of heavy computer-vision dependencies.
