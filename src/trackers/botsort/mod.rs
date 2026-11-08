@@ -324,6 +324,13 @@ impl BotSort {
         }
     }
 
+    /// The tracks that lost their detection and are kept for re-association,
+    /// each at its box predicted for the last updated frame, camera motion
+    /// included.
+    pub fn lost_tracks(&self) -> &[BotTrack] {
+        &self.lost_stracks
+    }
+
     /// Update the tracker with the current frame's detections and embeddings.
     ///
     /// `embeddings` is parallel to `detections`; pass an empty slice to track on
@@ -859,6 +866,18 @@ mod tests {
         assert_eq!(tracks.len(), 2);
         let b = tracks.iter().find(|t| t.track_id != a).unwrap();
         assert!((b.tlwh[0] - 404.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn lost_track_reports_its_predicted_box() {
+        let mut t = BotSort::default();
+        for x in [100.0, 110.0, 120.0, 130.0] {
+            t.update(vec![det(x, 10.0, 50.0, 100.0, 0.9)], &[]);
+        }
+        t.update(vec![], &[]);
+        let lost = t.lost_tracks();
+        assert_eq!(lost.len(), 1);
+        assert!(lost[0].tlwh[0] > 130.0, "x = {}", lost[0].tlwh[0]);
     }
 
     #[test]
