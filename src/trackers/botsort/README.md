@@ -8,8 +8,11 @@ This module implements the BoT-SORT algorithm.
 
 ## Algorithm overview
 
-BoT-SORT builds on ByteTrack's two-stage association and adds two pieces:
+BoT-SORT builds on ByteTrack's two-stage association and adds three pieces:
 
+- **A width-and-height Kalman state** `[x, y, w, h]` (`BoxState::WidthHeight`) in
+  place of ByteTrack's aspect ratio and height, so a track's width follows its
+  detections. While a track is lost its size velocities are held at zero.
 - **Camera motion compensation (CMC)** warps each track's Kalman prediction by a
   caller-supplied affine transform before association, so tracking survives panning and
   zooming cameras. The transform is the shared `common::cmc` infrastructure.
@@ -37,8 +40,8 @@ registration), keeping the core free of heavy computer-vision dependencies.
 
 ## Builds on
 
-- `utils::kalman` - the shared 8-dimensional Kalman filter
-- `utils::geometry` - `iou_batch`, `tlwh_to_xyah`
+- `utils::kalman` - the shared 8-dimensional Kalman filter, in its `WidthHeight` layout
+- `utils::geometry` - `iou_batch`
 - `utils::assignment` - `greedy_match`, `iou_match`
 - `trackers::common` - `KalmanTrack` and `CameraMotion` (CMC)
 - `trackers::byte_track` - the `TrackState` lifecycle shared with ByteTrack

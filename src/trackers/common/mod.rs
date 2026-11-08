@@ -15,8 +15,6 @@ pub use cmc::CameraMotion;
 pub use obs_track::ObsTrack;
 pub use params::CommonParams;
 
-use crate::utils::geometry::xyah_to_tlwh;
-
 /// A track as returned to Python: `(track_id, tlwh, score, class_id, det_ind)`.
 ///
 /// `det_ind` is the index of the detection this track was last created from or
@@ -39,7 +37,9 @@ pub fn to_py_tracking_results(
     .collect()
 }
 
-use crate::utils::kalman::{CovarianceMatrix, KalmanFilter, MeasurementVector, StateVector};
+use crate::utils::kalman::{
+    BoxState, CovarianceMatrix, KalmanFilter, MeasurementVector, StateVector,
+};
 
 /// Lifecycle state of a track.
 ///
@@ -63,17 +63,22 @@ pub enum TrackState {
 /// fields and delegates the filtering to this type.
 #[derive(Debug, Clone)]
 pub struct KalmanTrack {
-    /// Kalman filter state mean (`[x, y, a, h, vx, vy, va, vh]`).
+    /// Kalman filter state mean: the box in `box_state`, then its velocities.
     pub mean: StateVector,
     /// Kalman filter state covariance.
     pub covariance: CovarianceMatrix,
+    pub(crate) box_state: BoxState,
 }
 
 impl KalmanTrack {
-    /// Initialise the filter from a first measurement in XYAH form.
+    /// Initialise the filter from a first measurement in the filter's [`BoxState`].
     pub fn initiate(measurement: &MeasurementVector, kf: &KalmanFilter) -> Self {
         let (mean, covariance) = kf.initiate(measurement);
-        Self { mean, covariance }
+        Self {
+            mean,
+            covariance,
+            box_state: kf.box_state(),
+        }
     }
 
     /// Run one Kalman prediction step and return the refreshed TLWH box.
@@ -81,10 +86,10 @@ impl KalmanTrack {
         let (mean, covariance) = kf.predict(&self.mean, &self.covariance);
         self.mean = mean;
         self.covariance = covariance;
-        xyah_to_tlwh(&self.mean)
+        self.box_state.tlwh(&self.mean)
     }
 
-    /// Correct the state with a matched measurement in XYAH form.
+    /// Correct the state with a matched measurement in the filter's [`BoxState`].
     pub fn update(&mut self, measurement: &MeasurementVector, kf: &KalmanFilter) {
         let (mean, covariance) = kf.update(&self.mean, &self.covariance, measurement);
         self.mean = mean;
@@ -93,7 +98,7 @@ impl KalmanTrack {
 
     /// Warp the Kalman state by a camera motion transform and return the new TLWH box.
     pub fn apply_camera_motion(&mut self, cmc: &CameraMotion) -> [f32; 4] {
-        cmc.apply_state(&mut self.mean, &mut self.covariance);
-        xyah_to_tlwh(&self.mean)
+        cmc.apply_state(&mut self.mean, &mut self.covariance, self.box_state);
+        self.box_state.tlwh(&self.mean)
     }
 }

@@ -3,7 +3,7 @@
 use crate::trackers::common::byte_cascade::{self, CascadeDet, CascadeTrack};
 use crate::trackers::common::{CommonParams, KalmanTrack};
 use crate::utils::geometry::tlwh_to_xyah;
-use crate::utils::kalman::{CovarianceMatrix, KalmanFilter, StateVector};
+use crate::utils::kalman::{BoxState, CovarianceMatrix, KalmanFilter, StateVector};
 
 // Define STrack
 /// A Single Track (STrack) representing a tracked object.
@@ -58,6 +58,7 @@ impl STrack {
             kalman: KalmanTrack {
                 mean: StateVector::zeros(),
                 covariance: CovarianceMatrix::identity(),
+                box_state: BoxState::AspectHeight,
             },
         }
     }

@@ -8,7 +8,7 @@
 //! OC-SORT today, BoT-SORT and StrongSORT++ in the future) all apply it the same
 //! way through [`super::KalmanTrack::apply_camera_motion`].
 
-use crate::utils::kalman::{CovarianceMatrix, MeasurementVector, StateVector};
+use crate::utils::kalman::{BoxState, CovarianceMatrix, MeasurementVector, StateVector};
 
 /// A 2x3 affine camera-motion transform `[[a, b, tx], [c, d, ty]]`.
 ///
@@ -60,30 +60,41 @@ impl CameraMotion {
         (self.a * self.d - self.b * self.c).abs().sqrt()
     }
 
-    /// 8x8 linear warp matrix for the Kalman state `[x, y, a, h, vx, vy, va, vh]`.
+    /// 8x8 linear warp matrix for a Kalman state laid out as `box_state`.
     ///
-    /// Applies the 2x2 linear part to the position `(x, y)` and velocity
-    /// `(vx, vy)` blocks, the uniform scale to the height `h` and its velocity
-    /// `vh`, and leaves the aspect ratio `a` and its velocity unchanged.
-    fn linear_state_matrix(&self) -> CovarianceMatrix {
-        let scale = self.scale();
+    /// The 2x2 linear part applies to the position `(x, y)` and velocity
+    /// `(vx, vy)` blocks. In [`BoxState::AspectHeight`] the uniform scale applies
+    /// to the height `h` and its velocity, and the aspect ratio stays unchanged;
+    /// in [`BoxState::WidthHeight`] the linear part also applies to `(w, h)` and
+    /// its velocity, as the reference BoT-SORT warps its state.
+    fn linear_state_matrix(&self, box_state: BoxState) -> CovarianceMatrix {
         let mut r = CovarianceMatrix::identity();
-        r[(0, 0)] = self.a;
-        r[(0, 1)] = self.b;
-        r[(1, 0)] = self.c;
-        r[(1, 1)] = self.d;
-        r[(3, 3)] = scale;
-        r[(4, 4)] = self.a;
-        r[(4, 5)] = self.b;
-        r[(5, 4)] = self.c;
-        r[(5, 5)] = self.d;
-        r[(7, 7)] = scale;
+        let linear_blocks: &[usize] = match box_state {
+            BoxState::AspectHeight => {
+                let scale = self.scale();
+                r[(3, 3)] = scale;
+                r[(7, 7)] = scale;
+                &[0, 4]
+            }
+            BoxState::WidthHeight => &[0, 2, 4, 6],
+        };
+        for &i in linear_blocks {
+            r[(i, i)] = self.a;
+            r[(i, i + 1)] = self.b;
+            r[(i + 1, i)] = self.c;
+            r[(i + 1, i + 1)] = self.d;
+        }
         r
     }
 
-    /// Warp a Kalman mean and covariance in place.
-    pub fn apply_state(&self, mean: &mut StateVector, covariance: &mut CovarianceMatrix) {
-        let r = self.linear_state_matrix();
+    /// Warp a Kalman mean and covariance, laid out as `box_state`, in place.
+    pub fn apply_state(
+        &self,
+        mean: &mut StateVector,
+        covariance: &mut CovarianceMatrix,
+        box_state: BoxState,
+    ) {
+        let r = self.linear_state_matrix(box_state);
         let mut warped = r * *mean;
         warped[0] += self.tx;
         warped[1] += self.ty;
@@ -116,7 +127,7 @@ mod tests {
         let mut mean = StateVector::from_vec(vec![10.0, 20.0, 0.5, 40.0, 1.0, 2.0, 0.0, 0.0]);
         let original = mean;
         let mut cov = CovarianceMatrix::identity();
-        cmc.apply_state(&mut mean, &mut cov);
+        cmc.apply_state(&mut mean, &mut cov, BoxState::AspectHeight);
         assert!((mean - original).norm() < 1e-5);
     }
 
@@ -126,7 +137,7 @@ mod tests {
         assert!(!cmc.is_identity());
         let mut mean = StateVector::from_vec(vec![10.0, 20.0, 0.5, 40.0, 1.0, 2.0, 0.0, 0.0]);
         let mut cov = CovarianceMatrix::identity();
-        cmc.apply_state(&mut mean, &mut cov);
+        cmc.apply_state(&mut mean, &mut cov, BoxState::AspectHeight);
         assert!((mean[0] - 15.0).abs() < 1e-5);
         assert!((mean[1] - 17.0).abs() < 1e-5);
         // Pure translation leaves velocity untouched.
@@ -140,11 +151,21 @@ mod tests {
         let cmc = CameraMotion::new(2.0, 0.0, 0.0, 0.0, 2.0, 0.0);
         let mut mean = StateVector::from_vec(vec![10.0, 20.0, 0.5, 40.0, 1.0, 2.0, 0.0, 3.0]);
         let mut cov = CovarianceMatrix::identity();
-        cmc.apply_state(&mut mean, &mut cov);
+        cmc.apply_state(&mut mean, &mut cov, BoxState::AspectHeight);
         assert!((mean[0] - 20.0).abs() < 1e-5);
         assert!((mean[3] - 80.0).abs() < 1e-5); // height doubled
         assert!((mean[4] - 2.0).abs() < 1e-5); // vx doubled
         assert!((mean[7] - 6.0).abs() < 1e-5); // vh doubled
+    }
+
+    #[test]
+    fn scale_grows_width_and_height_in_a_width_height_state() {
+        let cmc = CameraMotion::new(2.0, 0.0, 0.0, 0.0, 2.0, 0.0);
+        let mut mean = StateVector::from_vec(vec![10.0, 20.0, 30.0, 40.0, 1.0, 2.0, 0.5, 3.0]);
+        let mut cov = CovarianceMatrix::identity();
+        cmc.apply_state(&mut mean, &mut cov, BoxState::WidthHeight);
+        let doubled = StateVector::from_vec(vec![20.0, 40.0, 60.0, 80.0, 2.0, 4.0, 1.0, 6.0]);
+        assert!((mean - doubled).norm() < 1e-5);
     }
 
     #[test]

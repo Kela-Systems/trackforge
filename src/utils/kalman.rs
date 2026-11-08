@@ -1,13 +1,53 @@
 use nalgebra::{SMatrix, SVector};
 
-/// 8-D Kalman state vector `[x, y, a, h, vx, vy, va, vh]`.
+use crate::utils::geometry::{tlwh_to_xyah, xyah_to_tlwh};
+
+/// 8-D Kalman state vector: the box's [`BoxState`] followed by its velocities.
 pub type StateVector = SVector<f32, 8>;
-/// 4-D measurement vector `[x, y, a, h]` (centre-x, centre-y, aspect ratio, height).
+/// 4-D measurement vector: a box in its [`BoxState`].
 pub type MeasurementVector = SVector<f32, 4>;
 /// 8×8 state covariance matrix.
 pub type CovarianceMatrix = SMatrix<f32, 8, 8>;
 /// 4×8 observation matrix mapping state space to measurement space.
 pub type MeasurementMatrix = SMatrix<f32, 4, 8>;
+
+/// How a box is laid out in the first four state components.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoxState {
+    /// `[x, y, a, h]`: centre, aspect ratio (`w / h`), height. The aspect ratio
+    /// is modelled as nearly constant (SORT, DeepSORT, ByteTrack).
+    #[default]
+    AspectHeight,
+    /// `[x, y, w, h]`: centre, width, height, each with noise proportional to
+    /// its own side (BoT-SORT).
+    WidthHeight,
+}
+
+impl BoxState {
+    /// A TLWH box as a measurement in this layout.
+    pub fn measure(self, tlwh: &[f32; 4]) -> MeasurementVector {
+        match self {
+            Self::AspectHeight => tlwh_to_xyah(tlwh),
+            Self::WidthHeight => MeasurementVector::new(
+                tlwh[0] + tlwh[2] / 2.0,
+                tlwh[1] + tlwh[3] / 2.0,
+                tlwh[2],
+                tlwh[3],
+            ),
+        }
+    }
+
+    /// The TLWH box of a state or measurement in this layout.
+    pub fn tlwh<const N: usize>(self, state: &SVector<f32, N>) -> [f32; 4] {
+        match self {
+            Self::AspectHeight => xyah_to_tlwh(state),
+            Self::WidthHeight => {
+                let (w, h) = (state[2], state[3]);
+                [state[0] - w / 2.0, state[1] - h / 2.0, w, h]
+            }
+        }
+    }
+}
 
 /// A standard Kalman Filter implementation for bounding box tracking.
 ///
@@ -18,6 +58,7 @@ pub struct KalmanFilter {
     update_mat: MeasurementMatrix,
     std_weight_position: f32,
     std_weight_velocity: f32,
+    box_state: BoxState,
 }
 
 impl KalmanFilter {
@@ -38,13 +79,34 @@ impl KalmanFilter {
             update_mat,
             std_weight_position,
             std_weight_velocity,
+            box_state: BoxState::default(),
+        }
+    }
+
+    /// This filter with its boxes laid out as `box_state`.
+    pub fn with_box_state(self, box_state: BoxState) -> Self {
+        Self { box_state, ..self }
+    }
+
+    pub fn box_state(&self) -> BoxState {
+        self.box_state
+    }
+
+    /// Per-component standard deviations for a box: `weight` times the side
+    /// each component scales with. In [`BoxState::AspectHeight`] the aspect
+    /// ratio takes the fixed `aspect_std` instead.
+    fn box_std(&self, state: &[f32], weight: f32, aspect_std: f32) -> [f32; 4] {
+        let (w, h) = (state[2], state[3]);
+        match self.box_state {
+            BoxState::AspectHeight => [weight * h, weight * h, aspect_std, weight * h],
+            BoxState::WidthHeight => [weight * w, weight * h, weight * w, weight * h],
         }
     }
 
     /// Initiate the Kalman Filter state from a measurement.
     ///
     /// # Arguments
-    /// * `measurement` - The initial measurement vector `[x, y, a, h]`.
+    /// * `measurement` - The initial measurement, in this filter's [`BoxState`].
     ///
     /// # Returns
     /// A tuple containing the initial Mean vector and Covariance matrix.
@@ -55,19 +117,15 @@ impl KalmanFilter {
         }
 
         let mut covariance = CovarianceMatrix::identity();
-        let std = [
-            2.0 * self.std_weight_position * measurement[3],
-            2.0 * self.std_weight_position * measurement[3],
-            1e-2,
-            2.0 * self.std_weight_position * measurement[3],
-            10.0 * self.std_weight_velocity * measurement[3],
-            10.0 * self.std_weight_velocity * measurement[3],
+        let std_pos = self.box_std(measurement.as_slice(), 2.0 * self.std_weight_position, 1e-2);
+        let std_vel = self.box_std(
+            measurement.as_slice(),
+            10.0 * self.std_weight_velocity,
             1e-5,
-            10.0 * self.std_weight_velocity * measurement[3],
-        ];
-
-        for i in 0..8 {
-            covariance[(i, i)] = std[i].powi(2);
+        );
+        for i in 0..4 {
+            covariance[(i, i)] = std_pos[i].powi(2);
+            covariance[(i + 4, i + 4)] = std_vel[i].powi(2);
         }
 
         (mean, covariance)
@@ -86,18 +144,8 @@ impl KalmanFilter {
         mean: &StateVector,
         covariance: &CovarianceMatrix,
     ) -> (StateVector, CovarianceMatrix) {
-        let std_pos = [
-            self.std_weight_position * mean[3],
-            self.std_weight_position * mean[3],
-            1e-2,
-            self.std_weight_position * mean[3],
-        ];
-        let std_vel = [
-            self.std_weight_velocity * mean[3],
-            self.std_weight_velocity * mean[3],
-            1e-5,
-            self.std_weight_velocity * mean[3],
-        ];
+        let std_pos = self.box_std(mean.as_slice(), self.std_weight_position, 1e-2);
+        let std_vel = self.box_std(mean.as_slice(), self.std_weight_velocity, 1e-5);
 
         let mut motion_cov = CovarianceMatrix::zeros();
         for i in 0..4 {
@@ -116,7 +164,7 @@ impl KalmanFilter {
     /// # Arguments
     /// * `mean` - The predicted state mean vector.
     /// * `covariance` - The predicted state covariance matrix.
-    /// * `measurement` - The new measurement vector `[x, y, a, h]`.
+    /// * `measurement` - The new measurement, in this filter's [`BoxState`].
     ///
     /// # Returns
     /// A tuple containing the updated Mean vector and Covariance matrix.
@@ -129,12 +177,7 @@ impl KalmanFilter {
         let projected_mean = self.update_mat * mean;
         let projected_cov = self.update_mat * covariance * self.update_mat.transpose();
 
-        let std = [
-            self.std_weight_position * mean[3],
-            self.std_weight_position * mean[3],
-            1e-1,
-            self.std_weight_position * mean[3],
-        ];
+        let std = self.box_std(mean.as_slice(), self.std_weight_position, 1e-1);
         let mut diag = SMatrix::<f32, 4, 4>::zeros();
         for i in 0..4 {
             diag[(i, i)] = std[i].powi(2);
@@ -157,7 +200,7 @@ impl KalmanFilter {
     /// Calculate the Mahalanobis distance between the track state and each measurement.
     ///
     /// Projects the track state into measurement space and computes the squared
-    /// Mahalanobis distance using the full `[x, y, a, h]` measurement vector.
+    /// Mahalanobis distance using the full measurement vector.
     ///
     /// # Arguments
     /// * `mean` - The current state mean.
@@ -175,12 +218,7 @@ impl KalmanFilter {
         let projected_mean = self.update_mat * mean;
         let projected_cov = self.update_mat * covariance * self.update_mat.transpose();
 
-        let std = [
-            self.std_weight_position * mean[3],
-            self.std_weight_position * mean[3],
-            1e-1,
-            self.std_weight_position * mean[3],
-        ];
+        let std = self.box_std(mean.as_slice(), self.std_weight_position, 1e-1);
         let mut diag = SMatrix::<f32, 4, 4>::zeros();
         for i in 0..4 {
             diag[(i, i)] = std[i].powi(2);
@@ -299,6 +337,30 @@ mod tests {
         assert_eq!(multi_distances.len(), 3);
         // First should be closest, last should be furthest
         assert!(multi_distances[0] < multi_distances[2]);
+    }
+
+    #[test]
+    fn width_height_follows_a_widening_box_that_aspect_height_lags() {
+        let width_after_widening = |box_state: BoxState| {
+            let kf = KalmanFilter::default().with_box_state(box_state);
+            let (mut mean, mut covariance) =
+                kf.initiate(&box_state.measure(&[0.0, 0.0, 40.0, 100.0]));
+            for _ in 0..3 {
+                (mean, covariance) = kf.predict(&mean, &covariance);
+                (mean, covariance) = kf.update(
+                    &mean,
+                    &covariance,
+                    &box_state.measure(&[0.0, 0.0, 80.0, 100.0]),
+                );
+            }
+            box_state.tlwh(&mean)[2]
+        };
+        let (followed, lagged) = (
+            width_after_widening(BoxState::WidthHeight),
+            width_after_widening(BoxState::AspectHeight),
+        );
+        assert!(followed > 75.0, "{followed}");
+        assert!(lagged < 50.0, "{lagged}");
     }
 
     #[test]

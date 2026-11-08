@@ -4,8 +4,8 @@ use crate::trackers::byte_track::TrackState;
 use crate::trackers::common::byte_cascade::{self, CascadeDet, CascadeTrack};
 use crate::trackers::common::{CameraMotion, CommonParams, KalmanTrack};
 use crate::utils::features::{cosine_distance, l2_normalize};
-use crate::utils::geometry::{iou_batch, tlwh_to_xyah};
-use crate::utils::kalman::KalmanFilter;
+use crate::utils::geometry::iou_batch;
+use crate::utils::kalman::{BoxState, KalmanFilter};
 
 /// Exponential moving-average weight for the per-track appearance feature.
 const FEATURE_MOMENTUM: f32 = 0.9;
@@ -54,7 +54,7 @@ pub struct BotTrack {
 impl BotTrack {
     /// Build an unactivated track from a detection (Kalman state seeded from its box).
     fn from_detection(det: &Detection, kf: &KalmanFilter) -> Self {
-        let kalman = KalmanTrack::initiate(&tlwh_to_xyah(&det.tlwh), kf);
+        let kalman = KalmanTrack::initiate(&kf.box_state().measure(&det.tlwh), kf);
         Self {
             tlwh: det.tlwh,
             score: det.score,
@@ -84,7 +84,7 @@ impl BotTrack {
 
     /// Kalman-correct with a matched detection and adopt its box, score, and class.
     fn absorb(&mut self, det: &Detection, frame_id: usize, kf: &KalmanFilter) {
-        self.kalman.update(&tlwh_to_xyah(&det.tlwh), kf);
+        self.kalman.update(&kf.box_state().measure(&det.tlwh), kf);
         self.tlwh = det.tlwh;
         self.score = det.score;
         self.class_id = det.class_id;
@@ -109,9 +109,10 @@ impl BotTrack {
         self.tracklet_len = 0;
     }
 
-    /// Kalman-predict one step forward, damping height velocity while not tracked.
+    /// Kalman-predict one step forward, holding the box size while not tracked.
     fn predict(&mut self, kf: &KalmanFilter) {
         if self.state != TrackState::Tracked {
+            self.kalman.mean[6] = 0.0;
             self.kalman.mean[7] = 0.0;
         }
         self.tlwh = self.kalman.predict(kf);
@@ -319,7 +320,7 @@ impl BotSort {
             second_match_thresh: params.second_match_thresh,
             proximity_thresh: params.proximity_thresh,
             appearance_thresh: params.appearance_thresh,
-            kalman_filter: KalmanFilter::default(),
+            kalman_filter: KalmanFilter::default().with_box_state(BoxState::WidthHeight),
             next_id: 1,
         }
     }
